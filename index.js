@@ -14,6 +14,7 @@ const resortLeadsRouter = require("./src/routes/resortLeads");
 const callsRouter = require("./src/routes/calls");
 const assistantRouter = require("./src/routes/assistant");
 const metaLeadsRouter = require("./src/routes/metaLeads");
+const usersRouter = require("./src/routes/users");
 const { startAutoSync } = require("./src/services/resortSyncService");
 const { startAutoSync: startMetaAutoSync } = require("./src/services/metaSyncService");
 
@@ -41,6 +42,7 @@ app.use("/api/resort-leads", requireAuth, resortLeadsRouter);
 app.use("/api/calls", requireAuth, callsRouter);
 app.use("/api/assistant", requireAuth, assistantRouter);
 app.use("/api/meta-leads", requireAuth, metaLeadsRouter);
+app.use("/api/users", requireAuth, usersRouter);
 
 async function start() {
   try {
