@@ -5,8 +5,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "backfill:createdby": "node scripts/backfillCreatedBy.js",
-    "migrate": "node scripts/runMigrations.js",
+    "sync:resort": "node scripts/syncResort.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
