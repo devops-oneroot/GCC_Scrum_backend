@@ -230,14 +230,39 @@ async function fetchCalls({
 const STATS_MAX_PAGES = 40; // up to 4000 calls per window
 let statsCache = new Map(); // key -> { at, stats }
 
+// Cache of ALL enriched calls in a window (for filtering across the whole range).
+let allCallsCache = new Map(); // key -> { at, calls }
+async function fetchAllCalls({ from, to } = {}) {
+  const key = `${from || ""}|${to || ""}`;
+  const cached = allCallsCache.get(key);
+  if (cached && Date.now() - cached.at < 60_000) return cached.calls;
+
+  const all = [];
+  let after;
+  let pages = 0;
+  do {
+    const { calls, metadata } = await fetchCalls({ pageSize: 100, from, to, after });
+    all.push(...calls);
+    after = metadata.nextCursor;
+    pages += 1;
+  } while (after && pages < STATS_MAX_PAGES);
+
+  allCallsCache.set(key, { at: Date.now(), calls: all });
+  return all;
+}
+
 /**
  * Aggregate stats over the WHOLE filtered window (not just the first page).
  * Pages through every call in the from..to range and tallies each metric.
  */
-async function fetchStats({ from, to } = {}) {
+async function fetchStats({ from, to, handledBy, search } = {}) {
   if (!isConfigured()) throw new Error("Exotel is not configured");
 
-  const key = `${from || ""}|${to || ""}`;
+  const hb = handledBy ? last10(handledBy) : "";
+  const q = String(search || "").trim().toLowerCase();
+  const filtered = Boolean(hb || q);
+
+  const key = `${from || ""}|${to || ""}|${hb}|${q}`;
   const cached = statsCache.get(key);
   if (cached && Date.now() - cached.at < 60_000) return cached.stats;
 
@@ -269,6 +294,14 @@ async function fetchStats({ from, to } = {}) {
     });
     if (stats.total === null) stats.total = metadata.total;
     for (const c of calls) {
+      // apply the same "scope" filters as the list (agent, search)
+      if (hb && last10(c.agentNumber) !== hb) continue;
+      if (q) {
+        const hay = `${c.from} ${c.to} ${c.customerNumber} ${
+          c.agentName || ""
+        } ${c.lead?.clientName || ""} ${c.lead?.salesExec || ""}`.toLowerCase();
+        if (!hay.includes(q)) continue;
+      }
       stats.windowTotal += 1;
       if (c.outcome === "successful") stats.answered += 1;
       else if (c.outcome === "hung_up") stats.hungUp += 1;
@@ -285,8 +318,8 @@ async function fetchStats({ from, to } = {}) {
   } while (after && pages < STATS_MAX_PAGES);
 
   stats.capped = Boolean(after); // more calls existed than we scanned
-  // When we scanned the whole window, the scanned count IS the true total.
-  if (!stats.capped) stats.total = stats.windowTotal;
+  // When filtered, or when we scanned the whole window, the tallied count IS the total.
+  if (filtered || !stats.capped) stats.total = stats.windowTotal;
   else if (stats.total == null) stats.total = stats.windowTotal;
   stats.uniqueCallers = callers.size;
   stats.matchedToLead = matchedLeads.size; // distinct enquiries, not calls
@@ -335,22 +368,42 @@ async function fetchAgentCallCounts({ from, to } = {}) {
   return data;
 }
 
-/** Distinct answering-agent numbers seen recently, with names + counts. */
-async function fetchAgents() {
-  const { calls } = await fetchCalls({ pageSize: 100 });
-  const map = new Map();
+/**
+ * All answering agents for the filter dropdown: every saved agent from the DB
+ * directory (so named agents always appear) merged with agents seen in the
+ * selected window (with call counts).
+ */
+async function fetchAgents({ from, to } = {}) {
+  const map = new Map(); // last10 -> { number, name, calls }
+
+  // 1) Seed with the saved directory so all named agents are always listed.
+  const [saved, nameMap, calls] = await Promise.all([
+    Agent.find({}, { number: 1, name: 1 }).lean(),
+    getAgentNameMap(),
+    fetchAllCalls({ from, to }),
+  ]);
+  for (const a of saved) {
+    const k = last10(a.number);
+    if (k.length >= 6) map.set(k, { number: a.number, name: a.name || "", calls: 0 });
+  }
+
+  // 2) Count calls in the window and pull in any agent not in the directory.
   for (const c of calls) {
     if (!c.agentNumber) continue;
     const k = last10(c.agentNumber);
     const cur = map.get(k) || {
       number: c.agentNumber,
-      name: c.agentName || "",
+      name: nameMap.get(k) || c.agentName || "",
       calls: 0,
     };
     cur.calls += 1;
+    if (!cur.name && (nameMap.get(k) || c.agentName)) cur.name = nameMap.get(k) || c.agentName;
     map.set(k, cur);
   }
-  return [...map.values()].sort((a, b) => b.calls - a.calls);
+
+  return [...map.values()].sort(
+    (a, b) => b.calls - a.calls || (a.name || a.number).localeCompare(b.name || b.number)
+  );
 }
 
 /** Upsert agent names. list = [{ number, name }]. */
@@ -417,6 +470,7 @@ module.exports = {
   isConfigured,
   fetchCalls,
   fetchStats,
+  fetchAllCalls,
   fetchAgents,
   fetchAgentCallCounts,
   saveAgents,
