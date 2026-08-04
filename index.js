@@ -15,6 +15,7 @@ const callsRouter = require("./src/routes/calls");
 const assistantRouter = require("./src/routes/assistant");
 const metaLeadsRouter = require("./src/routes/metaLeads");
 const usersRouter = require("./src/routes/users");
+const tasksRouter = require("./src/routes/tasks");
 const { startAutoSync } = require("./src/services/resortSyncService");
 const { startAutoSync: startMetaAutoSync } = require("./src/services/metaSyncService");
 
@@ -37,12 +38,25 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
+// The public IP this server goes out on — the value to whitelist in the Exotel
+// dashboard so recordings.exotel.com stops returning "Invalid IP".
+app.get("/my-ip", async (req, res) => {
+  try {
+    const response = await fetch("https://api.ipify.org");
+    const ip = await response.text();
+    res.json({ outboundIP: ip });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.use("/api/auth", authRouter);
 app.use("/api/resort-leads", requireAuth, resortLeadsRouter);
 app.use("/api/calls", requireAuth, callsRouter);
 app.use("/api/assistant", requireAuth, assistantRouter);
 app.use("/api/meta-leads", requireAuth, metaLeadsRouter);
 app.use("/api/users", requireAuth, usersRouter);
+app.use("/api/tasks", requireAuth, tasksRouter);
 
 async function start() {
   try {

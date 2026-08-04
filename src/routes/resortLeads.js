@@ -59,6 +59,32 @@ function buildFilter(q) {
   return filter;
 }
 
+/**
+ * Money a single enquiry represents: the quote once one has been given,
+ * otherwise the approx-revenue estimate. Same rule everywhere so section
+ * values, exec values and the grand total always add up.
+ */
+const LEAD_VALUE = {
+  $cond: [
+    { $gt: [{ $ifNull: ["$quote", 0] }, 0] },
+    "$quote",
+    { $ifNull: ["$approxRevenue", 0] },
+  ],
+};
+
+/** Sum LEAD_VALUE only for enquiries in one of the given statuses. */
+const valueWhereStatus = (statuses) => ({
+  $sum: { $cond: [{ $in: ["$status", statuses] }, LEAD_VALUE, 0] },
+});
+
+/** Count only enquiries in one of the given statuses. */
+const countWhereStatus = (statuses) => ({
+  $sum: { $cond: [{ $in: ["$status", statuses] }, 1, 0] },
+});
+
+/** Still in play — not yet won or lost. */
+const OPEN_STATUSES = ["new", "ongoing"];
+
 const SORT_FIELDS = {
   enquiryDate: "enquiryDate",
   bookingDate: "bookingDate",
@@ -199,9 +225,16 @@ router.get("/analytics", async (req, res) => {
   try {
     const filter = buildFilter(req.query);
 
+    // count + money value for every bucket of `field`
     const groupCount = (field) => [
       { $match: filter },
-      { $group: { _id: `$${field}`, count: { $sum: 1 } } },
+      {
+        $group: {
+          _id: `$${field}`,
+          count: { $sum: 1 },
+          amount: { $sum: LEAD_VALUE },
+        },
+      },
       { $sort: { count: -1 } },
     ];
 
@@ -247,21 +280,13 @@ router.get("/analytics", async (req, res) => {
             },
             // Value lost to "lost" enquiries — use the quote if present, else the
             // approx revenue estimate, so a lost lead always contributes its best figure.
-            lostValue: {
-              $sum: {
-                $cond: [
-                  { $eq: ["$status", "lost"] },
-                  {
-                    $cond: [
-                      { $gt: [{ $ifNull: ["$quote", 0] }, 0] },
-                      "$quote",
-                      { $ifNull: ["$approxRevenue", 0] },
-                    ],
-                  },
-                  0,
-                ],
-              },
-            },
+            lostValue: valueWhereStatus(["lost"]),
+            // Every enquiry's best figure, whatever its status — the denominator
+            // for "what share of the money did we actually convert?".
+            totalValue: { $sum: LEAD_VALUE },
+            // Still winnable: new + ongoing only.
+            openValue: valueWhereStatus(OPEN_STATUSES),
+            wonValue: valueWhereStatus(["onboarded"]),
           },
         },
       ]),
@@ -287,37 +312,16 @@ router.get("/analytics", async (req, res) => {
           $group: {
             _id: "$salesExec",
             total: { $sum: 1 },
-            won: {
-              $sum: { $cond: [{ $eq: ["$status", "onboarded"] }, 1, 0] },
-            },
-            lost: { $sum: { $cond: [{ $eq: ["$status", "lost"] }, 1, 0] } },
-            ongoing: {
-              $sum: { $cond: [{ $eq: ["$status", "ongoing"] }, 1, 0] },
-            },
-            wonValue: {
-              $sum: {
-                $cond: [
-                  { $eq: ["$status", "onboarded"] },
-                  { $ifNull: ["$quote", 0] },
-                  0,
-                ],
-              },
-            },
-            lostValue: {
-              $sum: {
-                $cond: [
-                  { $eq: ["$status", "lost"] },
-                  {
-                    $cond: [
-                      { $gt: [{ $ifNull: ["$quote", 0] }, 0] },
-                      "$quote",
-                      { $ifNull: ["$approxRevenue", 0] },
-                    ],
-                  },
-                  0,
-                ],
-              },
-            },
+            won: countWhereStatus(["onboarded"]),
+            lost: countWhereStatus(["lost"]),
+            ongoing: countWhereStatus(["ongoing"]),
+            fresh: countWhereStatus(["new"]),
+            // what this person is still carrying
+            open: countWhereStatus(OPEN_STATUSES),
+            openValue: valueWhereStatus(OPEN_STATUSES),
+            wonValue: valueWhereStatus(["onboarded"]),
+            lostValue: valueWhereStatus(["lost"]),
+            totalValue: { $sum: LEAD_VALUE },
           },
         },
         { $sort: { won: -1, total: -1 } },
@@ -345,20 +349,45 @@ router.get("/analytics", async (req, res) => {
         other: statusMap.other || 0,
         // Conversion = Onboarded ÷ Total Enquiries
         conversionRate: total ? Math.round((won / total) * 100) : 0,
+        // Value conversion = won money ÷ all money that passed through
+        valueConversionRate: rev.totalValue
+          ? Math.round(((rev.wonValue || 0) / rev.totalValue) * 100)
+          : 0,
         wonQuoteValue: rev.wonQuote || 0,
         wonApproxValue: rev.wonApprox || 0,
         pipelineApproxValue: rev.totalApprox || 0,
         totalQuoteValue: rev.totalQuote || 0,
         lostValue: rev.lostValue || 0,
+        wonValue: rev.wonValue || 0,
+        totalValue: rev.totalValue || 0,
+        // only new + ongoing — money still winnable
+        openValue: rev.openValue || 0,
       },
       byStatus: byStatus.map((d) => ({
         id: d._id,
         name: STATUS_META[d._id]?.label || d._id,
         value: d.count,
+        amount: d.amount || 0,
+        avg: d.count ? Math.round((d.amount || 0) / d.count) : 0,
+        share: rev.totalValue
+          ? Math.round(((d.amount || 0) / rev.totalValue) * 100)
+          : 0,
       })),
-      bySource: bySource.map((d) => ({ name: d._id || "Unknown", value: d.count })),
-      byQuery: byQuery.map((d) => ({ name: d._id || "Unknown", value: d.count })),
-      byExec: byExec.map((d) => ({ name: d._id || "Unassigned", value: d.count })),
+      bySource: bySource.map((d) => ({
+        name: d._id || "Unknown",
+        value: d.count,
+        amount: d.amount || 0,
+      })),
+      byQuery: byQuery.map((d) => ({
+        name: d._id || "Unknown",
+        value: d.count,
+        amount: d.amount || 0,
+      })),
+      byExec: byExec.map((d) => ({
+        name: d._id || "Unassigned",
+        value: d.count,
+        amount: d.amount || 0,
+      })),
       byPriority: byPriority
         .filter((d) => d._id)
         .map((d) => ({ name: d._id, value: d.count }))
@@ -374,10 +403,21 @@ router.get("/analytics", async (req, res) => {
         won: d.won,
         lost: d.lost,
         ongoing: d.ongoing,
-        wonValue: d.wonValue,
+        new: d.fresh || 0,
+        // still on this person's plate (new + ongoing)
+        open: d.open || 0,
+        openValue: d.openValue || 0,
+        wonValue: d.wonValue || 0,
         lostValue: d.lostValue || 0,
+        totalValue: d.totalValue || 0,
         // Conv. = Won ÷ Total enquiries handled by this exec
         conversion: d.total ? Math.round((d.won / d.total) * 100) : 0,
+        // Same idea in money terms
+        valueConversion: d.totalValue
+          ? Math.round(((d.wonValue || 0) / d.totalValue) * 100)
+          : 0,
+        // this exec's share of every enquiry in the current filter
+        loadShare: total ? Math.round((d.total / total) * 100) : 0,
       })),
     });
   } catch (err) {
@@ -385,13 +425,19 @@ router.get("/analytics", async (req, res) => {
   }
 });
 
-// GET /api/resort-leads/follow-ups — open enquiries bucketed by urgency
+// GET /api/resort-leads/follow-ups — open enquiries bucketed by urgency.
+// Accepts the same filters as the enquiries list (search, exec, type, priority,
+// source, month), except status — this view is the open pipeline by definition,
+// so status may only narrow to "new" or "ongoing".
 router.get("/follow-ups", async (req, res) => {
   try {
-    const filter = { status: { $in: ["new", "ongoing"] } };
-    if (req.query.salesExec) filter.salesExec = req.query.salesExec;
-    if (req.query.month)
-      filter.sheetMonth = { $in: String(req.query.month).split(",") };
+    const filter = buildFilter(req.query);
+
+    const asked = String(req.query.status || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => OPEN_STATUSES.includes(s));
+    filter.status = { $in: asked.length ? asked : OPEN_STATUSES };
 
     const leads = await ResortLead.find(filter)
       .sort({ priorityRank: 1, bookingDate: 1 })
@@ -419,10 +465,20 @@ router.get("/follow-ups", async (req, res) => {
       else buckets.upcoming.push(l);
     }
 
+    // same value rule as the analytics tab: quote, else the approx estimate
+    const leadValue = (l) =>
+      Number(l.quote) > 0 ? Number(l.quote) : Number(l.approxRevenue) || 0;
+    const sumValue = (arr) => arr.reduce((s, l) => s + leadValue(l), 0);
+
     res.json({
       counts: Object.fromEntries(
         Object.entries(buckets).map(([k, v]) => [k, v.length])
       ),
+      // money sitting in each urgency bucket
+      values: Object.fromEntries(
+        Object.entries(buckets).map(([k, v]) => [k, sumValue(v)])
+      ),
+      totals: { count: leads.length, value: sumValue(leads) },
       buckets,
     });
   } catch (err) {
