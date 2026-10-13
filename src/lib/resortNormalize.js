@@ -112,6 +112,8 @@ function normSource(v) {
   if (low.includes("promo")) return "Promotion";
   if (low.includes("mail")) return "Mail";
   if (low === "crm") return "CRM";
+  // "Whatsapp", "Whats Up", "WhatsApp" … → one source
+  if (/^whats?\s*(app|up)$/.test(low)) return "WhatsApp";
   return raw.replace(/\b\w/g, (c) => c.toUpperCase());
 }
 

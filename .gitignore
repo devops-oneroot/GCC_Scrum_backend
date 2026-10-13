@@ -51,3 +51,7 @@ uploads/
 data/
 # local backups (may contain secrets)
 *.bak
+
+# Google service account key (Gmail integration) — never commit
+google-service-account.json
+*service-account*.json

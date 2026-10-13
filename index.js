@@ -16,6 +16,8 @@ const assistantRouter = require("./src/routes/assistant");
 const metaLeadsRouter = require("./src/routes/metaLeads");
 const usersRouter = require("./src/routes/users");
 const tasksRouter = require("./src/routes/tasks");
+const emailsRouter = require("./src/routes/emails");
+const { router: whatsappRouter, webhook: whatsappWebhook } = require("./src/routes/whatsapp");
 const { startAutoSync } = require("./src/services/resortSyncService");
 const { startAutoSync: startMetaAutoSync } = require("./src/services/metaSyncService");
 
@@ -29,7 +31,14 @@ app.use(
   })
 );
 
-app.use(express.json());
+app.use(
+  express.json({
+    // the WhatsApp webhook signature is computed over the raw body
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
 app.get("/api/health", (_req, res) => {
   res.json({
@@ -57,6 +66,10 @@ app.use("/api/assistant", requireAuth, assistantRouter);
 app.use("/api/meta-leads", requireAuth, metaLeadsRouter);
 app.use("/api/users", requireAuth, usersRouter);
 app.use("/api/tasks", requireAuth, tasksRouter);
+app.use("/api/emails", requireAuth, emailsRouter);
+// Meta calls the webhook without a login, so it is mounted before the auth'd router.
+app.use("/api/whatsapp/webhook", whatsappWebhook);
+app.use("/api/whatsapp", requireAuth, whatsappRouter);
 
 async function start() {
   try {
@@ -66,6 +79,11 @@ async function start() {
     // Sheet → App mirror: sync once on boot, then on an interval.
     startAutoSync();
     startMetaAutoSync();
+    // Company Gmail mailboxes: full-history import + new mail every ~90s.
+    require("./src/services/gmailService").startEmailSync();
+
+    // Warm the Exotel call cache so the Calls tab opens instantly.
+    require("./src/services/exotelService").prewarm();
 
     app.listen(PORT, () => {
       console.log(

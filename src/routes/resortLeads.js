@@ -8,10 +8,19 @@ const {
 } = require("../services/resortSyncService");
 const { STATUS_META } = require("../lib/resortNormalize");
 const { clearLeadCache } = require("../services/exotelService");
+const { todayBusinessDate, BUSINESS_TZ } = require("../lib/businessDate");
 
 const router = express.Router();
 
 const VALID_STATUS = ["new", "ongoing", "onboarded", "lost", "other"];
+
+/** A plain calendar day, "2026-10-13". */
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Make a user-supplied string safe to drop into a RegExp. */
+function escapeRx(v) {
+  return String(v || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 const MONTH_IDX = {
   jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
@@ -46,7 +55,7 @@ function buildFilter(q) {
 
   const search = (q.search || "").trim();
   if (search) {
-    const rx = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    const rx = new RegExp(escapeRx(search), "i");
     filter.$or = [
       { leadId: rx },
       { clientName: rx },
@@ -480,6 +489,82 @@ router.get("/follow-ups", async (req, res) => {
       ),
       totals: { count: leads.length, value: sumValue(leads) },
       buckets,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+/**
+ * GET /api/resort-leads/follow-ups/calendar?from=&to=&scope=&salesExec=
+ *
+ * Per-day count of follow-ups still owed, so the calendar grid can show
+ * "4 follow-ups" on a day without pulling every lead down with it.
+ *
+ * "Due" is the same rule the /follow-ups board uses — the explicit reminder
+ * when one is set, otherwise the booking date — so the two screens can never
+ * disagree. Only open enquiries count, and only while the reminder has not
+ * been ticked off.
+ *
+ * Day keys are grouped in IST and the range is anchored to IST midnight, so a
+ * reminder saved late in the evening lands on the day the team would call it.
+ */
+router.get("/follow-ups/calendar", async (req, res) => {
+  try {
+    const today = todayBusinessDate();
+    const from = DATE_ONLY_RE.test(req.query.from || "") ? req.query.from : today;
+    const to = DATE_ONLY_RE.test(req.query.to || "") ? req.query.to : from;
+
+    const filter = { status: { $in: OPEN_STATUSES }, reminderDone: { $ne: true } };
+
+    // Everyone sees their own by default; scope=all opens it to the team, and an
+    // explicit salesExec narrows it to one person.
+    if (req.query.salesExec) {
+      filter.salesExec = { $in: String(req.query.salesExec).split(",") };
+    } else if (req.query.scope !== "all") {
+      // the sheet spells execs "Chetan" while the login is "chetan"
+      filter.salesExec = new RegExp(`^${escapeRx(req.userName || "")}$`, "i");
+    }
+
+    const DUE = { $ifNull: ["$nextFollowUpAt", "$bookingDate"] };
+    const dayKey = {
+      $dateToString: { format: "%Y-%m-%d", date: "$due", timezone: BUSINESS_TZ },
+    };
+
+    const [rows, overdue] = await Promise.all([
+      ResortLead.aggregate([
+        { $match: filter },
+        { $addFields: { due: DUE } },
+        {
+          $match: {
+            due: {
+              $gte: new Date(`${from}T00:00:00.000+05:30`),
+              $lte: new Date(`${to}T23:59:59.999+05:30`),
+            },
+          },
+        },
+        { $group: { _id: dayKey, pending: { $sum: 1 } } },
+        { $sort: { _id: 1 } },
+      ]),
+      ResortLead.aggregate([
+        { $match: filter },
+        { $addFields: { due: DUE } },
+        { $match: { due: { $ne: null, $lt: new Date(`${today}T00:00:00.000+05:30`) } } },
+        { $count: "n" },
+      ]),
+    ]);
+
+    const byDate = rows.map((r) => ({ date: r._id, pending: r.pending }));
+
+    res.json({
+      from,
+      to,
+      today,
+      scope: req.query.scope === "all" ? "all" : "mine",
+      byDate,
+      total: byDate.reduce((s, d) => s + d.pending, 0),
+      // everything already past its day, however far back — the nag number
+      overdueTotal: overdue[0]?.n || 0,
     });
   } catch (err) {
     res.status(500).json({ message: err.message });

@@ -8,11 +8,28 @@ const {
   fetchAgentCallCounts,
   saveAgents,
   fetchRecording,
+  connectCall,
 } = require("../services/exotelService");
+const {
+  transcribeCall,
+  transcriptMap,
+  isConfigured: transcriptionConfigured,
+} = require("../services/transcriptionService");
+const CallTranscript = require("../models/CallTranscript");
+const User = require("../models/User");
 
 const last10 = (v) => String(v || "").replace(/\D/g, "").slice(-10);
 
 const router = express.Router();
+
+/** Tag each call with its saved transcript summary, if any. */
+async function withTranscripts(calls) {
+  const map = await transcriptMap(calls.filter((c) => c.hasRecording).map((c) => c.sid));
+  return calls.map((c) => {
+    const t = map.get(c.sid);
+    return t ? { ...c, transcript: { summary: t.summary, result: t.result, nextStep: t.nextStep } } : c;
+  });
+}
 
 // GET /api/calls  — paginated, enriched call list
 router.get("/", async (req, res) => {
@@ -40,7 +57,7 @@ router.get("/", async (req, res) => {
         direction: req.query.direction,
         status: req.query.status,
       });
-      return res.json(result);
+      return res.json({ ...result, calls: await withTranscripts(result.calls) });
     }
 
     // Filter active → scan the WHOLE window so the filter covers every call,
@@ -72,7 +89,7 @@ router.get("/", async (req, res) => {
     }
 
     res.json({
-      calls,
+      calls: await withTranscripts(calls),
       metadata: {
         total: calls.length,
         pageSize: calls.length,
@@ -184,6 +201,48 @@ router.put("/agents", async (req, res) => {
     res.json({ configured: true, agents: await saveAgents(agents) });
   } catch (err) {
     res.status(502).json({ message: err.message });
+  }
+});
+
+// POST /api/calls/connect { to }  — ring the logged-in user's phone, then the customer
+router.post("/connect", async (req, res) => {
+  if (!isConfigured()) return res.status(503).json({ message: "Exotel not configured" });
+  const to = String(req.body?.to || "").replace(/[^\d+]/g, "");
+  if (last10(to).length !== 10) {
+    return res.status(400).json({ message: "Enter a valid 10-digit phone number" });
+  }
+  try {
+    const me = await User.findById(req.userId).select("phone").lean();
+    const from = last10(me?.phone);
+    if (from.length !== 10) {
+      return res.status(400).json({ message: "Your login has no valid phone number to ring" });
+    }
+    const call = await connectCall({ agentNumber: `0${from}`, customerNumber: `0${last10(to)}` });
+    res.json({ ...call, ringing: from });
+  } catch (err) {
+    res.status(502).json({ message: err.message });
+  }
+});
+
+// GET /api/calls/:sid/transcript  — the saved transcript (404 if not made yet)
+router.get("/:sid/transcript", async (req, res) => {
+  const t = await CallTranscript.findOne({ sid: req.params.sid }).lean();
+  if (!t) {
+    return res.status(404).json({ message: "Not transcribed yet", configured: transcriptionConfigured() });
+  }
+  res.json(t);
+});
+
+// POST /api/calls/:sid/transcript  — transcribe the recording (?force=1 to redo)
+router.post("/:sid/transcript", async (req, res) => {
+  try {
+    const t = await transcribeCall(req.params.sid, {
+      force: req.query.force === "1",
+      by: req.userName,
+    });
+    res.json(t);
+  } catch (err) {
+    res.status(err.status || 502).json({ message: err.message });
   }
 });
 
