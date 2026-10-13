@@ -77,11 +77,13 @@ const SYSTEM_PROMPT = [
   "The transcript has no speaker labels, one line per audio segment; a line may hold both speakers.",
   "Split it into turns and decide who is speaking from context: the agent greets with the resort name, quotes prices, describes rooms/meals/packages and offers to send details; the customer asks questions, gives dates, guest counts and negotiates.",
   "This is a transcript, NOT a summary: keep every meaningful sentence, in the original order, as close to the speaker's own words as possible. Do not merge separate exchanges or shorten them; a question and its answer are separate turns.",
+  "Non-English parts are usually Kannada, Telugu, Tamil or Hindi, and the speech engine often writes them phonetically in the WRONG script (e.g. Kannada speech spelled in Telugu letters, mixed with English words like 'per plate', 'decoration', 'November'). Read such text by its sound, work out the meaning and translate it to English — do not treat it as gibberish, and never output any non-English script.",
   "Write every turn in plain English. Translate any non-English words. Fix only obvious mis-hearings, keep all numbers, prices, dates and names exactly as heard, and drop meaningless filler and repeated 'hello's. Never add words nobody said; skip garbled parts you cannot understand.",
-  'Reply with JSON only: {"turns":[{"speaker":"agent"|"customer","text":string}],"summary":string,"result":string,"nextStep":string}.',
+  'Reply with JSON only: {"turns":[{"speaker":"agent"|"customer","text":string}],"summary":string,"result":string,"nextStep":string,"details":[{"label":string,"value":string}]}.',
   "summary: 1-3 short sentences — what the customer wanted (dates, guests, room type, budget, prices quoted) and how the call ended.",
   `result: exactly one of ${RESULTS.join(", ")} — booked if the customer confirmed/paid; follow_up if a quote, details or a callback was promised; interested if they engaged positively with no next step; not_interested if they declined; no_conversation if nobody really spoke; unclear only when you truly cannot tell.`,
   'nextStep: the agreed follow-up in a few words, or "".',
+  'details: up to 6 key facts that were actually said, each a short label + value, chosen from: Enquiry (e.g. Room Stay), Check-in, Check-out, Guests, Room type, Price quoted, Meals, Callback. Omit anything not mentioned.',
 ].join(" ");
 
 async function chatJson(model, text) {
@@ -109,7 +111,7 @@ async function chatJson(model, text) {
 
 /** Speaker turns + summary. Never throws — falls back to the raw lines. */
 async function toConversation(text) {
-  if (!text) return { turns: [], summary: "", result: "no_conversation", nextStep: "" };
+  if (!text) return { turns: [], details: [], summary: "", result: "no_conversation", nextStep: "" };
   const { chatModel } = cfg();
   // the smaller model is a fallback for rate limits on the free tier
   for (const model of [...new Set([chatModel, "openai/gpt-oss-20b"])]) {
@@ -121,8 +123,16 @@ async function toConversation(text) {
           text: String(t?.text || "").trim(),
         }))
         .filter((t) => t.text);
+      const details = (Array.isArray(j.details) ? j.details : [])
+        .map((d) => ({
+          label: String(d?.label || "").trim(),
+          value: String(d?.value || "").trim(),
+        }))
+        .filter((d) => d.label && d.value)
+        .slice(0, 6);
       return {
         turns,
+        details,
         summary: String(j.summary || "").trim(),
         result: RESULTS.includes(j.result) ? j.result : "unclear",
         nextStep: String(j.nextStep || "").trim(),
@@ -131,14 +141,36 @@ async function toConversation(text) {
       console.warn(`[transcribe] ${model} failed:`, err.message);
     }
   }
-  return { turns: [], summary: "", result: "unclear", nextStep: "" };
+  return { turns: [], details: [], summary: "", result: "unclear", nextStep: "" };
+}
+
+/**
+ * Transcripts saved before the English conversation view have only raw text
+ * (often mixed-language). Rebuild their turns from the stored text — no new
+ * recording download needed — and save, so each is upgraded once.
+ */
+async function upgradeIfOld(t) {
+  if (!t || t.turns?.length || !t.text || !isConfigured()) return t;
+  const convo = await toConversation(t.text);
+  if (!convo.turns.length) return t;
+  return CallTranscript.findOneAndUpdate(
+    { sid: t.sid },
+    { $set: convo },
+    { returnDocument: "after" }
+  ).lean();
+}
+
+/** The saved transcript for a call (upgraded to the English chat format), or null. */
+async function getTranscript(sid) {
+  const t = await CallTranscript.findOne({ sid }).lean();
+  return upgradeIfOld(t);
 }
 
 const pending = new Map(); // sid -> promise, so double-clicks share one job
 
 async function transcribeCall(sid, { force = false, by = "" } = {}) {
   if (!force) {
-    const existing = await CallTranscript.findOne({ sid }).lean();
+    const existing = await getTranscript(sid);
     if (existing) return existing;
   }
   if (pending.has(sid)) return pending.get(sid);
@@ -162,7 +194,7 @@ async function transcribeCall(sid, { force = false, by = "" } = {}) {
     return CallTranscript.findOneAndUpdate(
       { sid },
       { $set: { text, language, ...convo, createdBy: by } },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+      { upsert: true, returnDocument: "after", setDefaultsOnInsert: true }
     ).lean();
   })().finally(() => pending.delete(sid));
 
@@ -180,4 +212,4 @@ async function transcriptMap(sids) {
   return new Map(rows.map((r) => [r.sid, r]));
 }
 
-module.exports = { isConfigured, transcribeCall, transcriptMap };
+module.exports = { isConfigured, transcribeCall, transcriptMap, getTranscript };

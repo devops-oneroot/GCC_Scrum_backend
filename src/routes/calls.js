@@ -14,8 +14,8 @@ const {
   transcribeCall,
   transcriptMap,
   isConfigured: transcriptionConfigured,
+  getTranscript,
 } = require("../services/transcriptionService");
-const CallTranscript = require("../models/CallTranscript");
 const User = require("../models/User");
 
 const last10 = (v) => String(v || "").replace(/\D/g, "").slice(-10);
@@ -226,7 +226,12 @@ router.post("/connect", async (req, res) => {
 
 // GET /api/calls/:sid/transcript  — the saved transcript (404 if not made yet)
 router.get("/:sid/transcript", async (req, res) => {
-  const t = await CallTranscript.findOne({ sid: req.params.sid }).lean();
+  let t;
+  try {
+    t = await getTranscript(req.params.sid);
+  } catch (err) {
+    return res.status(502).json({ message: err.message });
+  }
   if (!t) {
     return res.status(404).json({ message: "Not transcribed yet", configured: transcriptionConfigured() });
   }

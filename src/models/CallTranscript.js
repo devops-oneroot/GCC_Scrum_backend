@@ -26,6 +26,11 @@ const callTranscriptSchema = new mongoose.Schema(
     // interested | follow_up | booked | not_interested | no_conversation | unclear
     result: { type: String, default: "" },
     nextStep: { type: String, default: "" },
+    // key facts pulled from the call: [{ label: "Guests", value: "4 adults, 3 kids" }]
+    details: {
+      type: [{ _id: false, label: String, value: String }],
+      default: [],
+    },
     createdBy: { type: String, default: "" },
   },
   { timestamps: true, collection: "resort_call_transcripts" }
