@@ -49,3 +49,5 @@ uploads/
 
 # MongoDB local data (if any)
 data/
+# local backups (may contain secrets)
+*.bak
