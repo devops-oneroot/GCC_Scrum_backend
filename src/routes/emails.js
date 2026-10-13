@@ -87,21 +87,19 @@ router.get("/threads", async (req, res) => {
       ];
     }
 
-    const [result] = await EmailMessage.aggregate(
+    // Two passes so no sort ever holds whole messages: Atlas shared tiers cap
+    // in-memory sorts at 32 MB and ignore allowDiskUse. Pass 1 pages tiny
+    // {thread, lastDate} keys; pass 2 loads details for just this page.
+    const [keys] = await EmailMessage.aggregate(
       [
         { $match: match },
-        { $sort: { date: -1 } },
         {
           $group: {
             _id: { mailbox: "$mailbox", threadId: "$threadId" },
-            latest: { $first: "$$ROOT" },
-            count: { $sum: 1 },
-            unread: { $max: "$isUnread" },
-            hasAttachments: { $max: "$hasAttachments" },
-            senders: { $addToSet: "$from" },
+            date: { $max: "$date" },
           },
         },
-        { $sort: { "latest.date": -1 } },
+        { $sort: { date: -1 } },
         {
           $facet: {
             items: [{ $skip: (page - 1) * limit }, { $limit: limit }],
@@ -112,8 +110,40 @@ router.get("/threads", async (req, res) => {
       { allowDiskUse: true }
     );
 
-    const total = result.total[0]?.n || 0;
-    const items = result.items.map((t) => ({
+    const total = keys.total[0]?.n || 0;
+    const pageKeys = keys.items.map((k) => k._id);
+    const details = pageKeys.length
+      ? await EmailMessage.aggregate([
+          { $match: { ...match, $and: [{ $or: pageKeys }] } },
+          { $sort: { date: -1 } },
+          {
+            $group: {
+              _id: { mailbox: "$mailbox", threadId: "$threadId" },
+              latest: {
+                $first: {
+                  gmailId: "$gmailId",
+                  subject: "$subject",
+                  snippet: "$snippet",
+                  date: "$date",
+                  from: "$from",
+                  to: "$to",
+                  isSent: "$isSent",
+                },
+              },
+              count: { $sum: 1 },
+              unread: { $max: "$isUnread" },
+              hasAttachments: { $max: "$hasAttachments" },
+              senders: { $addToSet: "$from" },
+            },
+          },
+        ])
+      : [];
+    const byKey = new Map(details.map((d) => [`${d._id.mailbox}|${d._id.threadId}`, d]));
+    const threads = pageKeys
+      .map((k) => byKey.get(`${k.mailbox}|${k.threadId}`))
+      .filter(Boolean);
+
+    const items = threads.map((t) => ({
       mailbox: t._id.mailbox,
       threadId: t._id.threadId,
       subject: t.latest.subject,

@@ -8,7 +8,19 @@ const mongoose = require("mongoose");
 const callTranscriptSchema = new mongoose.Schema(
   {
     sid: { type: String, required: true, unique: true, trim: true },
+    // raw English speech-to-text, one line per audio segment
     text: { type: String, default: "" },
+    // the same call split into speaker turns
+    turns: {
+      type: [
+        {
+          _id: false,
+          speaker: { type: String, enum: ["agent", "customer"] },
+          text: String,
+        },
+      ],
+      default: [],
+    },
     language: { type: String, default: "" },
     summary: { type: String, default: "" },
     // interested | follow_up | booked | not_interested | no_conversation | unclear
