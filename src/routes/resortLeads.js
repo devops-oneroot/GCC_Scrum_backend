@@ -531,19 +531,23 @@ router.get("/follow-ups/calendar", async (req, res) => {
       $dateToString: { format: "%Y-%m-%d", date: "$due", timezone: BUSINESS_TZ },
     };
 
-    const [rows, overdue] = await Promise.all([
-      ResortLead.aggregate([
-        { $match: filter },
-        { $addFields: { due: DUE } },
-        {
-          $match: {
-            due: {
-              $gte: new Date(`${from}T00:00:00.000+05:30`),
-              $lte: new Date(`${to}T23:59:59.999+05:30`),
-            },
+    const inRange = [
+      { $match: filter },
+      { $addFields: { due: DUE } },
+      {
+        $match: {
+          due: {
+            $gte: new Date(`${from}T00:00:00.000+05:30`),
+            $lte: new Date(`${to}T23:59:59.999+05:30`),
           },
         },
-        { $group: { _id: dayKey, pending: { $sum: 1 } } },
+      },
+    ];
+
+    const [rows, overdue, leads] = await Promise.all([
+      ResortLead.aggregate([
+        ...inRange,
+        { $group: { _id: dayKey, pending: { $sum: 1 }, execs: { $addToSet: "$salesExec" } } },
         { $sort: { _id: 1 } },
       ]),
       ResortLead.aggregate([
@@ -552,9 +556,61 @@ router.get("/follow-ups/calendar", async (req, res) => {
         { $match: { due: { $ne: null, $lt: new Date(`${today}T00:00:00.000+05:30`) } } },
         { $count: "n" },
       ]),
+      // The leads themselves, so the day panel can say who is on each one.
+      // salesExec owns the enquiry; the latest "followup_set" activity says who
+      // put the reminder on the calendar (absent when it is just the booking date).
+      ResortLead.aggregate([
+        ...inRange,
+        { $sort: { due: 1, priorityRank: 1 } },
+        {
+          $lookup: {
+            from: "resortactivities",
+            let: { lid: "$leadId" },
+            pipeline: [
+              { $match: { $expr: { $eq: ["$leadId", "$$lid"] }, type: "followup_set" } },
+              { $sort: { createdAt: -1 } },
+              { $limit: 1 },
+              { $project: { _id: 0, userName: 1, createdAt: 1 } },
+            ],
+            as: "lastSet",
+          },
+        },
+        {
+          $project: {
+            leadId: 1,
+            clientName: 1,
+            companyName: 1,
+            contactNo: 1,
+            query: 1,
+            status: 1,
+            priorityCode: 1,
+            salesExec: 1,
+            followUpCount: 1,
+            lastInteraction: 1,
+            // same value rule as the analytics tab: quote, else the approx estimate
+            value: {
+              $cond: [
+                { $gt: [{ $ifNull: ["$quote", 0] }, 0] },
+                "$quote",
+                { $ifNull: ["$approxRevenue", 0] },
+              ],
+            },
+            valueIsQuote: { $gt: [{ $ifNull: ["$quote", 0] }, 0] },
+            nextFollowUpAt: 1,
+            bookingDate: 1,
+            date: dayKey,
+            fromReminder: { $ne: [{ $ifNull: ["$nextFollowUpAt", null] }, null] },
+            setBy: { $arrayElemAt: ["$lastSet.userName", 0] },
+          },
+        },
+      ]),
     ]);
 
-    const byDate = rows.map((r) => ({ date: r._id, pending: r.pending }));
+    const byDate = rows.map((r) => ({
+      date: r._id,
+      pending: r.pending,
+      execs: (r.execs || []).sort(),
+    }));
 
     res.json({
       from,
@@ -565,6 +621,7 @@ router.get("/follow-ups/calendar", async (req, res) => {
       total: byDate.reduce((s, d) => s + d.pending, 0),
       // everything already past its day, however far back — the nag number
       overdueTotal: overdue[0]?.n || 0,
+      items: leads,
     });
   } catch (err) {
     res.status(500).json({ message: err.message });
