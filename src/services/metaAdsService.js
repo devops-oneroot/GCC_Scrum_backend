@@ -1,6 +1,7 @@
 /**
  * Direct Meta Marketing API (Graph API) connection — the "Meta Ads (Live)" tab.
- * Pure Meta data — nothing here reads the Meta-Report Google Sheet (that is metaSyncService).
+ * Leads/spend come from Meta; "who handles it" + follow-up come from the CRM's own
+ * enquiry records, matched by phone (see attachHandling).
  *
  * Env:
  *   META_ADS_ACCESS_TOKEN  System User / long-lived token with ads_read
@@ -8,6 +9,11 @@
  *   META_AD_ACCOUNT_ID     Ad account id, with or without the "act_" prefix
  *   META_GRAPH_VERSION     optional, defaults to v21.0
  */
+
+const ResortLead = require("../models/ResortLead");
+const MetaLead = require("../models/MetaLead");
+const MetaAdLeadFollowUp = require("../models/MetaAdLeadFollowUp");
+const User = require("../models/User");
 
 const CACHE_MS = 5 * 60 * 1000;
 const cache = new Map(); // key -> { at, data }
@@ -286,7 +292,7 @@ function fieldValue(fields, ...names) {
  * Lead-form submissions, read per ad (needs leads_retrieval on the token and
  * the token's user/system-user having access to the Page that owns the forms).
  */
-async function getLeads(range = {}, fresh = false) {
+async function fetchMetaLeads(range = {}, fresh = false) {
   const { account } = config();
   const key = `leads:${JSON.stringify(range)}`;
   return cached(key, fresh, async () => {
@@ -352,6 +358,156 @@ async function getLeads(range = {}, fresh = false) {
   });
 }
 
+const last10 = (v) => String(v || "").replace(/\D/g, "").slice(-10);
+
+/**
+ * Who is handling each Meta lead and where the follow-up stands, from the CRM
+ * enquiries (exec, status, next follow-up, count, last interaction) with the
+ * Meta leads register as a fallback for the exec/remarks. Read on every request
+ * (not cached with the Meta data) so updates by the team show immediately.
+ */
+async function attachHandling(data) {
+  const phones = new Set(data.leads.map((l) => last10(l.phone)).filter((p) => p.length === 10));
+  const byPhone = new Map();
+  if (phones.size) {
+    const [enquiries, registers] = await Promise.all([
+      ResortLead.find({ contactNo: { $ne: "" } })
+        .select("leadId contactNo salesExec status statusRaw nextFollowUpAt followUpCount lastInteraction comment internalNote")
+        .sort({ enquiryDate: 1 })
+        .lean(),
+      MetaLead.find({ contactNo: { $ne: "" } })
+        .select("contactNo salesExec status remarks")
+        .lean(),
+    ]);
+    // registers first, enquiries override (they carry the follow-up details);
+    // later enquiries win, so a repeat enquiry shows the latest owner
+    for (const r of registers) {
+      const p = last10(r.contactNo);
+      if (!phones.has(p)) continue;
+      byPhone.set(p, {
+        salesExec: r.salesExec,
+        status: r.status,
+        nextFollowUpAt: null,
+        followUpCount: 0,
+        lastNote: r.remarks || "",
+      });
+    }
+    for (const r of enquiries) {
+      const p = last10(r.contactNo);
+      if (!phones.has(p)) continue;
+      byPhone.set(p, {
+        enquiryId: r.leadId,
+        salesExec: r.salesExec,
+        status: r.statusRaw || r.status,
+        nextFollowUpAt: r.nextFollowUpAt,
+        followUpCount: r.followUpCount || 0,
+        lastNote: r.internalNote || r.lastInteraction || r.comment || "",
+      });
+    }
+  }
+  const isAssigned = (h) => h && h.salesExec && !/^unassigned$/i.test(h.salesExec);
+
+  // Follow-ups recorded in this tab — these are the source of truth when present.
+  const own = await MetaAdLeadFollowUp.find({ metaLeadId: { $in: data.leads.map((l) => l.id) } })
+    .select("-history")
+    .lean();
+  const ownById = new Map(own.map((f) => [f.metaLeadId, f]));
+
+  const leads = data.leads.map((l) => {
+    const h = byPhone.get(last10(l.phone)) || null;
+    const f = ownById.get(l.id);
+    return {
+      ...l,
+      handling: isAssigned(h) ? h : h ? { ...h, salesExec: "" } : null,
+      followUp: f
+        ? {
+            stage: f.stage,
+            assignedTo: f.assignedTo,
+            nextFollowUpAt: f.nextFollowUpAt,
+            lastNote: f.lastNote,
+            updatedBy: f.updatedBy,
+            updatedAt: f.updatedAt,
+          }
+        : null,
+    };
+  });
+  return { ...data, leads };
+}
+
+async function getLeads(range = {}, fresh = false) {
+  return attachHandling(await fetchMetaLeads(range, fresh));
+}
+
+/** Every campaign's id/name/status for the filter — names rarely change, so cache 30 min. */
+async function getAllCampaigns(fresh = false) {
+  const { account } = config();
+  const hit = cache.get("campaign-names");
+  if (!fresh && hit && Date.now() - hit.at < 30 * 60 * 1000) return hit.data;
+  try {
+    const rows = await graphAll(`${account}/campaigns`, { fields: "id,name,effective_status" }, 2000);
+    const data = rows.map((c) => ({ id: c.id, name: c.name, status: c.effective_status }));
+    cache.set("campaign-names", { at: Date.now(), data });
+    return data;
+  } catch (err) {
+    if (hit) return hit.data;
+    throw err;
+  }
+}
+
+/** Save a follow-up update for one Meta lead and append it to the history. */
+async function saveFollowUp(metaLeadId, input, byName) {
+  const STAGES = MetaAdLeadFollowUp.STAGES;
+  const set = { updatedBy: byName || "" };
+  const entry = { at: new Date(), by: byName || "" };
+  if (input.stage !== undefined) {
+    if (!STAGES.includes(input.stage)) throw new Error(`Unknown stage "${input.stage}"`);
+    set.stage = entry.stage = input.stage;
+  }
+  if (input.assignedTo !== undefined) set.assignedTo = entry.assignedTo = String(input.assignedTo).trim();
+  if (input.nextFollowUpAt !== undefined) {
+    const d = input.nextFollowUpAt ? new Date(input.nextFollowUpAt) : null;
+    if (d && Number.isNaN(d.getTime())) throw new Error("Invalid follow-up date");
+    set.nextFollowUpAt = entry.nextFollowUpAt = d;
+  }
+  if (input.note) set.lastNote = entry.note = String(input.note).trim();
+  // closed leads need no further follow-up
+  if (set.stage === "won" || set.stage === "lost") set.nextFollowUpAt = entry.nextFollowUpAt = null;
+
+  for (const k of ["name", "phone", "campaignName"]) {
+    if (input[k]) set[k] = String(input[k]).trim();
+  }
+  return MetaAdLeadFollowUp.findOneAndUpdate(
+    { metaLeadId },
+    { $set: set, $push: { history: { $each: [entry], $position: 0 } } },
+    { upsert: true, returnDocument: "after", setDefaultsOnInsert: true }
+  ).lean();
+}
+
+async function getFollowUp(metaLeadId) {
+  return MetaAdLeadFollowUp.findOne({ metaLeadId }).lean();
+}
+
+/** Names to offer in the "Handled by" picker: CRM logins + execs already used on leads. */
+async function getHandlers() {
+  const [users, a, b, c] = await Promise.all([
+    User.find().select("name").lean(),
+    MetaLead.distinct("salesExec"),
+    ResortLead.distinct("salesExec"),
+    MetaAdLeadFollowUp.distinct("assignedTo"),
+  ]);
+  const names = [...users.map((u) => u.name), ...a, ...b, ...c]
+    .map((n) => String(n || "").trim())
+    .filter((n) => n && !n.includes(",") && !/^(unassigned|na|n\/a|-)$/i.test(n));
+  // one entry per person regardless of case ("kiran" / "Kiran"), preferring a capitalised spelling
+  const byKey = new Map();
+  for (const n of names) {
+    const k = n.toLowerCase();
+    const cur = byKey.get(k);
+    if (!cur || (cur[0] !== cur[0].toUpperCase() && n[0] === n[0].toUpperCase())) byKey.set(k, n);
+  }
+  return [...byKey.values()].sort((x, y) => x.localeCompare(y));
+}
+
 async function getStatus() {
   const c = config();
   if (!c.configured) {
@@ -372,4 +528,14 @@ async function getStatus() {
   }
 }
 
-module.exports = { config, getOverview, getLeads, getStatus, MetaApiError };
+module.exports = {
+  config,
+  getOverview,
+  getLeads,
+  getAllCampaigns,
+  getStatus,
+  saveFollowUp,
+  getFollowUp,
+  getHandlers,
+  MetaApiError,
+};

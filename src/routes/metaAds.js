@@ -1,7 +1,24 @@
 const express = require("express");
-const { config, getOverview, getLeads, getStatus } = require("../services/metaAdsService");
+const {
+  config,
+  getOverview,
+  getLeads,
+  getAllCampaigns,
+  getStatus,
+  saveFollowUp,
+  getFollowUp,
+  getHandlers,
+} = require("../services/metaAdsService");
 
 const router = express.Router();
+
+// Meta Ads (Live) is restricted: the main admin, plus whoever the main admin has granted access.
+router.use((req, res, next) => {
+  if (!req.metaAdsAccess) {
+    return res.status(403).json({ message: "You don't have access to Meta Ads. Ask the main admin." });
+  }
+  next();
+});
 
 const ISO = /^\d{4}-\d{2}-\d{2}$/;
 function rangeFrom(q = {}) {
@@ -40,6 +57,44 @@ router.get("/leads", async (req, res) => {
     res.json(await getLeads(rangeFrom(req.query), req.query.refresh === "1"));
   } catch (err) {
     res.status(502).json({ message: err.message, code: err.code });
+  }
+});
+
+// GET /api/meta-ads/campaigns — every campaign (id, name, status) for the filter
+router.get("/campaigns", async (req, res) => {
+  if (!config().configured) return notConfigured(res);
+  try {
+    res.json({ campaigns: await getAllCampaigns(req.query.refresh === "1") });
+  } catch (err) {
+    res.status(502).json({ message: err.message, code: err.code });
+  }
+});
+
+// GET /api/meta-ads/handlers — names for the "Handled by" picker
+router.get("/handlers", async (_req, res) => {
+  try {
+    res.json({ handlers: await getHandlers() });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// GET /api/meta-ads/leads/:id/follow-up — current state + full history
+router.get("/leads/:id/follow-up", async (req, res) => {
+  try {
+    res.json({ followUp: await getFollowUp(req.params.id) });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// PUT /api/meta-ads/leads/:id/follow-up — { stage, assignedTo, nextFollowUpAt, note, name, phone, campaignName }
+router.put("/leads/:id/follow-up", async (req, res) => {
+  try {
+    const f = await saveFollowUp(req.params.id, req.body || {}, req.userName);
+    res.json({ followUp: f });
+  } catch (err) {
+    res.status(400).json({ message: err.message });
   }
 });
 

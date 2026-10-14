@@ -54,6 +54,12 @@ router.patch("/:id", async (req, res) => {
     const update = {};
     if (req.body.name) update.name = String(req.body.name).trim();
     if (req.body.role) update.role = req.body.role === "admin" ? "admin" : "sales";
+    if (typeof req.body.metaAdsAccess === "boolean") {
+      // only the main admin hands out Meta Ads access
+      if (!req.isMainAdmin)
+        return res.status(403).json({ message: "Only the main admin can change Meta Ads access" });
+      update.metaAdsAccess = req.body.metaAdsAccess;
+    }
     if (req.body.password) {
       if (String(req.body.password).length < 6)
         return res.status(400).json({ message: "Password must be at least 6 characters" });

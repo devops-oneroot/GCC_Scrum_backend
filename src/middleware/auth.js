@@ -23,7 +23,7 @@ async function requireAuth(req, res, next) {
 
   try {
     const payload = jwt.verify(token, getJwtSecret());
-    const user = await User.findById(payload.sub).select("role name adminScope");
+    const user = await User.findById(payload.sub).select("role name phone adminScope metaAdsAccess");
     if (!user) {
       return res.status(401).json({ message: "User not found" });
     }
@@ -31,6 +31,8 @@ async function requireAuth(req, res, next) {
     req.userRole = user.role || "sales";
     req.userName = user.name?.trim() || "";
     req.isAdmin = req.userRole === "admin";
+    req.isMainAdmin = user.phone === User.MAIN_ADMIN_PHONE;
+    req.metaAdsAccess = req.isMainAdmin || !!user.metaAdsAccess;
     req.adminScope =
       req.isAdmin && user.adminScope === "export" ? "export" : "all";
     next();
